@@ -59,6 +59,7 @@ import { useInteractivity } from "../../context/interactivity"
 import { abbreviateHome } from "../../runtime"
 import { Slot } from "../../plugin/render"
 import type { SessionInbox } from "@opencode/schema/session-inbox"
+import { Permission } from "@opencode/schema/permission"
 import {
   deduplicatePromptImages,
   preserveMentionlessPromptAttachments,
@@ -70,6 +71,17 @@ import { directoryRecentValue } from "../../prompt/directory-completion"
 import { useWorkingDirectoryActions } from "../../ui/working-directory-actions"
 import { truncateFilePath } from "../../ui/file-path"
 import { PromptMetadataRow } from "./metadata"
+import {
+  Harness,
+  executeHarness,
+  harnessAccess,
+  requestsWorkspaceWrite,
+  routeTask,
+  routeTaskWithJev,
+  withHarnessMemory,
+  type HarnessTraceEvent,
+  type RouteDecision,
+} from "../../ecode-router"
 
 export type PromptProps = {
   sessionID?: string
@@ -1156,15 +1168,24 @@ export function Prompt(props: PromptProps) {
       toast.show({ message: "Editor context cannot be queued", variant: "warning" })
       return false
     }
+    const selectedHarness = local.harness.current()
+    const routeDecision: RouteDecision | undefined =
+      selectedHarness === Harness.Router
+        ? routeTask(inputText)
+        : selectedHarness === Harness.Ecode
+          ? undefined
+          : { harness: selectedHarness, access: harnessAccess(inputText) }
+    const routedHarness = routeDecision?.harness ?? Harness.Ecode
+    const usesLocalHarness = store.mode === "normal" && routedHarness !== Harness.Ecode
     const agent = local.agent.current()
-    if (!agent) return false
+    if (!agent && !usesLocalHarness) return false
     const selection = local.model.selection()
-    if (!selection) {
+    if (!selection && !usesLocalHarness) {
       void promptModelWarning()
       return false
     }
-    const usesModel = !props.sessionID || store.mode !== "shell"
-    if (usesModel && !local.model.available(selection)) {
+    const usesModel = (!props.sessionID || store.mode !== "shell") && !usesLocalHarness
+    if (usesModel && selection && !local.model.available(selection)) {
       toast.show({
         title: "Model unavailable",
         message: `${selection.providerID}/${selection.modelID} is not available in this session's location`,
@@ -1207,7 +1228,7 @@ export function Prompt(props: PromptProps) {
       )
     }
 
-    const variant = selection.variant
+    const variant = selection?.variant
     let sessionID = props.sessionID
     let session = sessionID ? data.session.get(sessionID) : undefined
     let finishMoveProgress = false
@@ -1233,12 +1254,15 @@ export function Prompt(props: PromptProps) {
       const created = data.session.create({
         id: newSessionID,
         location: directory ? { directory } : location,
-        agent: agent.id,
-        model: {
-          providerID: selection.providerID,
-          id: selection.modelID,
-          variant,
-        },
+        agent: usesLocalHarness ? undefined : agent?.id,
+        model:
+          !usesLocalHarness && selection
+            ? {
+                providerID: selection.providerID,
+                id: selection.modelID,
+                variant,
+              }
+            : undefined,
       })
       if (newSessionID !== undefined) created.request.catch(() => args.restoreNewSessionID(newSessionID))
       sessionID = created.id
@@ -1274,6 +1298,7 @@ export function Prompt(props: PromptProps) {
 
     const target = sessionID
     const prepareAgent = async () => {
+      if (!agent) return
       if (!session) {
         await data.session.sync(target)
         session = data.session.get(target)
@@ -1283,6 +1308,7 @@ export function Prompt(props: PromptProps) {
       }
     }
     const commitModel = () => {
+      if (!selection || !agent) return Promise.reject(new Error("Select an ecode provider model first"))
       const model = { providerID: selection.providerID, id: selection.modelID, variant }
       const cancelCommit = local.model.trackSessionCommit(target, model, agent.id)
       return client.api.session.switchModel({ sessionID: target, model }).catch((error) => {
@@ -1304,7 +1330,133 @@ export function Prompt(props: PromptProps) {
       return true
     }
     history.append(entry)
-    if (currentMode === "shell") {
+    if (usesLocalHarness) {
+      const harnessPrompt = withHarnessMemory(inputText, data.session.message.list(target))
+      move.startSubmit()
+      const send = async () => {
+        await client.api.session.synthetic({
+          sessionID: target,
+          text: inputText,
+          description: inputText,
+          metadata: { source: "harness-user" },
+          delivery,
+          resume: false,
+        })
+        const directory =
+          data.session.get(target)?.location.directory ??
+          currentLocation.current?.directory ??
+          data.location.default().directory ??
+          paths.cwd
+        let used = selectedHarness === Harness.Router ? await routeTaskWithJev(inputText) : routeDecision!
+        toast.show({
+          title: selectedHarness === Harness.Router ? "Router selected a coding harness" : "Coding harness selected",
+          message:
+            used.harness === Harness.Codex
+              ? used.model
+                ? `Codex CLI · ${used.model}`
+                : "Codex CLI"
+              : used.harness === Harness.ClaudeCode
+                ? "Claude Code"
+                : "OpenCode CLI",
+          variant: "info",
+        })
+
+        if (used.access === "write") {
+          const allowed = await requestHarnessWritePermission({
+            sessionID: target,
+            harness: used.harness,
+            directory,
+          })
+          if (!allowed) {
+            const output = "Coding harness write access was denied. No external harness was started."
+            await client.api.session.synthetic({
+              sessionID: target,
+              text: output,
+              description: output,
+              metadata: { source: "harness", harness: used.harness, state: "error" },
+              resume: false,
+            })
+            return
+          }
+        }
+
+        const publishTrace = async (event: Exclude<HarnessTraceEvent, { type: "message" }>) => {
+          await client.api.session.synthetic({
+            sessionID: target,
+            text: harnessTraceText(event),
+            description: harnessTraceText(event),
+            metadata: {
+              source: "harness-trace",
+              event: event.type,
+              harness: used.harness,
+              ...(event.type === "command" ? { command: event.command } : {}),
+              ...(event.type === "command" && event.output ? { output: event.output } : {}),
+              ...(event.type === "command" && event.exitCode !== undefined ? { exitCode: event.exitCode } : {}),
+            },
+            resume: false,
+          })
+        }
+        let result = await executeHarness(used, harnessPrompt, directory, publishTrace)
+        let writeDenied = false
+        if (used.access === "read" && requestsWorkspaceWrite(result)) {
+          const allowed = await requestHarnessWritePermission({
+            sessionID: target,
+            harness: used.harness,
+            directory,
+          })
+          if (allowed) {
+            used = { ...used, access: "write" }
+            await publishTrace({ type: "status", text: "Write access approved · retrying the coding harness" })
+            result = await executeHarness(used, harnessPrompt, directory, publishTrace)
+          } else {
+            writeDenied = true
+            result = {
+              exitCode: 1,
+              stdout: "Coding harness write access was denied. The task was not retried.",
+              stderr: "",
+            }
+          }
+        }
+        if (
+          !writeDenied &&
+          selectedHarness === Harness.Router &&
+          result.exitCode !== 0 &&
+          used.harness !== Harness.Codex
+        ) {
+          const fallback: RouteDecision = { harness: Harness.Codex, model: "gpt-5.6-sol", access: used.access }
+          const allowed =
+            fallback.access === "read" ||
+            (await requestHarnessWritePermission({
+              sessionID: target,
+              harness: fallback.harness,
+              directory,
+            }))
+          if (allowed) {
+            used = fallback
+            await publishTrace({ type: "status", text: "Falling back to Codex CLI · gpt-5.6-sol" })
+            result = await executeHarness(used, harnessPrompt, directory, publishTrace)
+          } else {
+            await publishTrace({ type: "error", text: "Codex fallback write access was denied." })
+          }
+        }
+        const output = result.stdout || result.stderr || `Harness exited with code ${result.exitCode}`
+        await client.api.session.synthetic({
+          sessionID: target,
+          text: output,
+          description: output,
+          metadata: {
+            source: "harness",
+            harness: used.harness,
+            ...(used.model ? { model: used.model } : {}),
+            state: result.exitCode === 0 ? "completed" : "error",
+          },
+          resume: false,
+        })
+      }
+      void (newSession
+        ? newSession.gate.then(send).catch(newSession.recover)
+        : send().catch((error) => fail("Coding harness failed", error)))
+    } else if (currentMode === "shell") {
       move.startSubmit()
       const send = () => client.api.session.shell({ sessionID: target, command: inputText })
       void (newSession ? newSession.gate.then(send).catch(newSession.recover) : send())
@@ -1373,6 +1525,40 @@ export function Prompt(props: PromptProps) {
       if (pendingEditorSelection) editor.markSelectionSent()
     }
 
+    async function requestHarnessWritePermission(input: {
+      sessionID: string
+      harness: Exclude<Harness, "router" | "ecode">
+      directory: string
+    }) {
+      const id = Permission.ID.create()
+      const resource = `${input.harness}:${input.directory}`
+      let dispose = () => {}
+      const replied = new Promise<boolean>((resolve) => {
+        dispose = data.on("permission.replied", (event) => {
+          if (event.data.sessionID !== input.sessionID || event.data.requestID !== id) return
+          dispose()
+          resolve(event.data.reply !== "reject")
+        })
+      })
+
+      try {
+        const result = await client.api.permission.create({
+          id,
+          sessionID: input.sessionID,
+          action: "harness_write",
+          resources: [resource],
+          save: [resource],
+          metadata: { harness: input.harness, directory: input.directory },
+        })
+        if (result.effect === "ask") return replied
+        dispose()
+        return result.effect === "allow"
+      } catch (error) {
+        dispose()
+        throw error
+      }
+    }
+
     // Optimistic admission puts the message in the store synchronously, so
     // the session view renders it on arrival.
     if (!props.sessionID) {
@@ -1394,6 +1580,16 @@ export function Prompt(props: PromptProps) {
     }
     if (finishMoveProgress) move.finishSubmit()
     return true
+  }
+
+  function harnessTraceText(event: Exclude<HarnessTraceEvent, { type: "message" }>) {
+    if (event.type === "command") {
+      const output = event.output?.trim()
+      const exit = event.exitCode === undefined ? "" : `\nExited with code ${event.exitCode}`
+      return [`$ ${event.command}`, output, exit].filter(Boolean).join("\n")
+    }
+    if (event.type === "tool") return event.detail ? `${event.name}\n${event.detail}` : event.name
+    return event.text
   }
 
   function pasteText(text: string, virtualText: string) {
@@ -1548,19 +1744,29 @@ export function Prompt(props: PromptProps) {
 
       const agent = local.agent.current()
       const model = local.model.parsed()
+      const harness = local.harness.current()
       return {
         agentLabel: agent ? Locale.titlecase(agent.id) : undefined,
         agentColor: agent ? local.agent.color(agent.id) : undefined,
-        modelLabel: model.model,
-        providerLabel: model.provider,
+        modelLabel:
+          harness === Harness.Router
+            ? "Router"
+            : harness === Harness.Codex
+              ? "Codex CLI"
+              : harness === Harness.ClaudeCode
+                ? "Claude Code"
+                : harness === Harness.OpenCode
+                  ? "OpenCode CLI"
+                  : model.model,
+        providerLabel: harness === Harness.Ecode ? model.provider : "local",
         variant: local.model.variant.current(),
       }
     },
     {
       agentLabel: undefined,
       agentColor: undefined,
-      modelLabel: local.model.parsed().model,
-      providerLabel: local.model.parsed().provider,
+      modelLabel: local.harness.current() === Harness.Router ? "Router" : local.model.parsed().model,
+      providerLabel: local.harness.current() === Harness.Ecode ? local.model.parsed().provider : "local",
       variant: undefined,
     },
   )

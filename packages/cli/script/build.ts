@@ -32,6 +32,10 @@ const skipInstall = process.argv.includes("--skip-install")
 const skipWebUi = process.argv.includes("--skip-web-ui")
 const solidPlugin = createSolidTransformPlugin()
 const highlights = Script.preview ? undefined : embed(process.env.OPENCODE_RELEASE_NOTES)
+// Branch builds use a 0.0.0-* development identifier, but OpenCode Console
+// enforces a minimum compatible client version from the User-Agent. Keep the
+// branch channel while advertising the fork's upstream package version.
+const productVersion = Script.preview ? pkg.version : Script.version
 const releaseAssets = new Map<string, Promise<Map<string, string>>>()
 
 const allTargets: {
@@ -180,7 +184,7 @@ export default { path: file, version: ${JSON.stringify(opencodePty.version)}, sh
       outfile: path.join(outdir, name, "bin", binary),
       execArgv: [
         "--smol",
-        `--user-agent=opencode/${Script.channel}/${Script.version}/cli`,
+        `--user-agent=opencode/${Script.channel}/${productVersion}/cli`,
         "--use-system-ca",
         "--no-warnings",
         "--",
@@ -188,8 +192,8 @@ export default { path: file, version: ${JSON.stringify(opencodePty.version)}, sh
       windows: {},
     },
     define: {
-      OPENCODE_VERSION: `'${Script.version}'`,
-      OPENCODE_CLI_NAME: "'opencode'",
+      OPENCODE_VERSION: `'${productVersion}'`,
+      OPENCODE_CLI_NAME: "'ecode'",
       OPENCODE_CHANNEL: `'${Script.channel}'`,
       OPENCODE_ARTIFACT: `'cli'`,
       ...(highlights ? { OPENCODE_RELEASE_HIGHLIGHTS: JSON.stringify(highlights) } : {}),
@@ -205,14 +209,20 @@ export default { path: file, version: ${JSON.stringify(opencodePty.version)}, sh
     process.exit(1)
   }
   verifySimulationGraph(simulationInputs)
-  await NativeArch.verify(path.join(outdir, name, "bin", item.os === "win32" ? `${binary}.exe` : binary), item.arch)
+  const artifact = path.join(outdir, name, "bin", item.os === "win32" ? `${binary}.exe` : binary)
+  await NativeArch.verify(artifact, item.arch)
+  // Bun emits a linker-signed Mach-O. Refresh the ad-hoc signature after compilation so
+  // newer macOS code-signing monitors do not terminate local builds with "Invalid Page".
+  if (item.os === "darwin" && process.platform === "darwin") {
+    await $`codesign --force --sign - --timestamp=none ${artifact}`
+  }
 
   await Bun.write(
     path.join(outdir, name, "package.json"),
     JSON.stringify(
       {
         name: `@opencode/${name}`,
-        version: Script.version,
+        version: productVersion,
         license: "MIT",
         repository: { type: "git", url: "git+https://github.com/anomalyco/opencode.git" },
         os: [item.os],

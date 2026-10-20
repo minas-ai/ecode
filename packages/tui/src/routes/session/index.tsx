@@ -291,6 +291,33 @@ export function Session(props: {
   const [firstJump, setFirstJump] = createSignal<() => void>()
   const [synced, setSynced] = createSignal(false)
   const sessionTabs = useSessionTabs()
+  const [harnessTraceView, setHarnessTraceView] = createStore({
+    all: false,
+    overrides: {} as Record<string, boolean>,
+  })
+  const harnessTraceExpanded = (messageID: string) =>
+    harnessTraceView.overrides[messageID] ?? harnessTraceView.all
+  const setHarnessTracesExpanded = (expanded: boolean) =>
+    setHarnessTraceView({ all: expanded, overrides: {} })
+  const harnessGroups = createMemo(() =>
+    rows.flatMap((row) => (row.type === "group" && row.kind === "harness" ? [row] : [])),
+  )
+  const harnessGroupsExpanded = createMemo(() => {
+    const groups = harnessGroups()
+    return (
+      groups.length > 0 &&
+      groups.every((group) => {
+        const id = groupID(group, 0)
+        return id ? groupExpanded(id, "harness") : false
+      })
+    )
+  })
+  const setHarnessGroupsExpanded = (expanded: boolean) => {
+    harnessGroups().forEach((group) => {
+      const id = groupID(group, 0)
+      if (id) sessionTabs.setGroupExpanded(sessionID, id, expanded)
+    })
+  }
   const [awayFromBottom, setAwayFromBottom] = createSignal(false)
   const [latestHovered, setLatestHovered] = createSignal(false)
   let ensureAllRowsPending: (() => void)[] | undefined
@@ -1070,6 +1097,21 @@ export function Session(props: {
       },
     },
     {
+      title: harnessGroupsExpanded() ? "Collapse coding harness traces" : "Expand coding harness traces",
+      id: "session.toggle.harness_traces",
+      group: "Session",
+      run: () => {
+        const expanded = !harnessGroupsExpanded()
+        setHarnessGroupsExpanded(expanded)
+        toast.show({
+          message: expanded ? "Coding harness traces expanded" : "Coding harness traces collapsed",
+          variant: "info",
+          duration: 2000,
+        })
+        dialog.clear()
+      },
+    },
+    {
       title: `Verbosity: ${Locale.titlecase(verbosity())}`,
       id: "session.verbosity.cycle",
       group: "Session",
@@ -1141,7 +1183,9 @@ export function Session(props: {
       },
       run: () => {
         const lastAssistantMessage = messagesBeforeRevert().findLast(
-          (msg) => msg.type === "assistant" || (msg.type === "compaction" && msg.status === "completed" && msg.summary.trim() !== ""),
+          (msg) =>
+            msg.type === "assistant" ||
+            (msg.type === "compaction" && msg.status === "completed" && msg.summary.trim() !== ""),
         )
         if (!lastAssistantMessage) {
           toast.show({ message: "No assistant messages found", variant: "error" })
@@ -1341,6 +1385,11 @@ export function Session(props: {
       value={{
         anchors,
         groupExpanded,
+        harnessTraceExpanded,
+        setHarnessTraceExpanded: (messageID, expanded) =>
+          setHarnessTraceView("overrides", messageID, expanded),
+        harnessTracesExpanded: () => harnessTraceView.all,
+        setHarnessTracesExpanded,
         setGroupExpanded: (id, expanded, anchor) => {
           // A group that ends the transcript would open off screen while the reader follows the bottom.
           const last = rows.findLast((row) => row.type !== "assistant-footer" && row.type !== "turn-usage")
@@ -1451,9 +1500,7 @@ export function Session(props: {
                   onMouseOut={() => setLatestHovered(false)}
                   onMouseUp={toBottom}
                 >
-                  <text
-                    fg={latestHovered() ? theme.text.action.secondary.hovered : theme.text.action.secondary.base}
-                  >
+                  <text fg={latestHovered() ? theme.text.action.secondary.hovered : theme.text.action.secondary.base}>
                     Jump to latest ↓
                   </text>
                 </box>
@@ -1499,12 +1546,7 @@ export function Session(props: {
                     }}
                   </Show>
                 </Match>
-                <Match
-                  when={
-                    session() &&
-                    currentLocation.error?.location.directory === session()!.location.directory
-                  }
-                >
+                <Match when={session() && currentLocation.error?.location.directory === session()!.location.directory}>
                   <SessionLocationMissing
                     directory={session()!.location.directory}
                     projectID={session()!.projectID}
@@ -1964,11 +2006,25 @@ function SessionSwitchMessageV2(props: { message: SessionMessageInfo }) {
 function SessionNoticeMessageV2(props: { message: SessionMessageInfo }) {
   const ctx = use()
   const theme = useTheme()
+  const { currentSyntax: syntax } = useThemes()
+  const plugins = usePlugin()
   const renderer = useRenderer()
   const { navigate } = useRoute()
   const [hover, setHover] = createSignal(false)
   const metadata = () => (props.message.type === "synthetic" ? props.message.metadata : undefined)
   const source = () => stringValue(metadata()?.source)
+  const harness = () => stringValue(metadata()?.harness)
+  const model = () => stringValue(metadata()?.model)
+  const harnessEvent = () => stringValue(metadata()?.event)
+  const harnessCommand = () => stringValue(metadata()?.command)
+  const harnessOutput = () => stringValue(metadata()?.output)
+  const harnessExitCode = () => finiteNumber(metadata()?.exitCode)
+  const traceExpanded = () => ctx.harnessTraceExpanded(props.message.id)
+  const toggleTrace = () => {
+    if (renderer.getSelection()?.getSelectedText()) return
+    ctx.setHarnessTraceExpanded(props.message.id, !traceExpanded())
+  }
+  const traceSummary = () => text().split("\n", 1)[0] ?? ""
   const completion = () => source() === "subagent" || source() === "shell"
   const childID = () => (source() === "subagent" ? stringValue(metadata()?.childID) : undefined)
   const state = () => stringValue(metadata()?.state)
@@ -1994,29 +2050,190 @@ function SessionNoticeMessageV2(props: { message: SessionMessageInfo }) {
   }
   return (
     <Show
-      when={completion()}
+      when={source() === "harness" || source() === "harness-user" || source() === "harness-trace"}
       fallback={
-        <InlineToolRow icon="◈" color={theme.text.muted} pending="Notice" complete={true}>
-          {text()}
-        </InlineToolRow>
+        <Show
+          when={completion()}
+          fallback={
+            <InlineToolRow icon="◈" color={theme.text.muted} pending="Notice" complete={true}>
+              {text()}
+            </InlineToolRow>
+          }
+        >
+          <box
+            marginLeft={3}
+            onMouseOver={() => childID() && setHover(true)}
+            onMouseOut={() => setHover(false)}
+            onMouseUp={() => {
+              if (renderer.getSelection()?.getSelectedText()) return
+              const id = childID()
+              if (id) navigate({ type: "session", sessionID: id })
+            }}
+          >
+            <text wrapMode="none">
+              <span style={{ fg: color() }}>{heading()}</span>
+              <span style={{ fg: theme.text.muted }}>{suffix()}</span>
+            </text>
+          </box>
+        </Show>
       }
     >
-      <box
-        marginLeft={3}
-        onMouseOver={() => childID() && setHover(true)}
-        onMouseOut={() => setHover(false)}
-        onMouseUp={() => {
-          if (renderer.getSelection()?.getSelectedText()) return
-          const id = childID()
-          if (id) navigate({ type: "session", sessionID: id })
-        }}
+      <Show
+        when={source() === "harness-user"}
+        fallback={
+          <Show
+            when={source() === "harness-trace"}
+            fallback={
+              <box paddingTop={1} paddingLeft={3} flexDirection="column">
+                <text fg={state() === "error" ? theme.text.feedback.error.base : theme.text.muted}>
+                  {harness() === "claude-code"
+                    ? "Claude Code"
+                    : harness() === "opencode"
+                      ? "OpenCode CLI"
+                      : "Codex CLI"}
+                  {model() ? ` · ${model()}` : ""}
+                </text>
+                <markdown
+                  syntaxStyle={syntax()}
+                  renderNode={plugins.markdown()}
+                  streaming={false}
+                  internalBlockMode="top-level"
+                  content={stripAnsi(text())}
+                  tableOptions={{ style: "grid", cellPaddingX: 1 }}
+                  conceal={ctx.markdownMode() === "rendered"}
+                  fg={state() === "error" ? theme.text.feedback.error.base : theme.markdown.text}
+                  bg={theme.background.base}
+                />
+              </box>
+            }
+          >
+            <Switch>
+              <Match when={harnessEvent() === "command"}>
+                <box
+                  paddingLeft={3}
+                  onMouseOver={() => setHover(true)}
+                  onMouseOut={() => setHover(false)}
+                  onMouseUp={toggleTrace}
+                >
+                  <box flexDirection="row">
+                    <box width={INLINE_TOOL_ICON_WIDTH} flexShrink={0}>
+                      <text fg={hover() ? theme.text.base : theme.text.muted}>{traceExpanded() ? "−" : "+"}</text>
+                    </box>
+                    <text
+                      flexGrow={1}
+                      minWidth={0}
+                      wrapMode={traceExpanded() ? "word" : "none"}
+                      truncate={!traceExpanded()}
+                      fg={hover() ? theme.text.base : theme.text.muted}
+                    >
+                      $ {harnessCommand() ?? "Command"}
+                    </text>
+                  </box>
+                  <Show when={traceExpanded()}>
+                    <box paddingLeft={2} flexDirection="column">
+                      <Show when={harnessOutput()}>
+                        <text fg={theme.text.muted}>{stripAnsi(harnessOutput() ?? "").trim()}</text>
+                      </Show>
+                      <Show when={harnessExitCode() !== undefined}>
+                        <text
+                          fg={
+                            harnessExitCode() === 0 ? theme.text.muted : theme.text.feedback.error.base
+                          }
+                        >
+                          Exited with code {harnessExitCode()}
+                        </text>
+                      </Show>
+                    </box>
+                  </Show>
+                </box>
+              </Match>
+              <Match when={harnessEvent() === "reasoning"}>
+                <HarnessTraceDisclosure
+                  messageID={props.message.id}
+                  title="Thinking"
+                  detail={text()}
+                />
+              </Match>
+              <Match when={harnessEvent() === "file"}>
+                <HarnessTraceDisclosure
+                  messageID={props.message.id}
+                  title={`File · ${traceSummary()}`}
+                  detail={text()}
+                />
+              </Match>
+              <Match when={harnessEvent() === "error"}>
+                <HarnessTraceDisclosure
+                  messageID={props.message.id}
+                  title={`Failed · ${traceSummary()}`}
+                  detail={text()}
+                  error
+                />
+              </Match>
+              <Match when={true}>
+                <HarnessTraceDisclosure
+                  messageID={props.message.id}
+                  title={`${harnessEvent() === "tool" ? "Tool" : "Working"} · ${traceSummary()}`}
+                  detail={text()}
+                />
+              </Match>
+            </Switch>
+          </Show>
+        }
       >
-        <text wrapMode="none">
-          <span style={{ fg: color() }}>{heading()}</span>
-          <span style={{ fg: theme.text.muted }}>{suffix()}</span>
+        <box
+          border={["left"]}
+          borderColor={theme.hue.accent[400]}
+          customBorderChars={SplitBorder.customBorderChars}
+          backgroundColor={theme.background.raised.base}
+        >
+          <box paddingTop={1} paddingBottom={1} paddingLeft={2} backgroundColor={theme.background.raised.base}>
+            <text fg={theme.text.base}>{text()}</text>
+          </box>
+        </box>
+      </Show>
+    </Show>
+  )
+}
+
+function HarnessTraceDisclosure(props: {
+  messageID: string
+  title: string
+  detail: string
+  error?: boolean
+}) {
+  const ctx = use()
+  const theme = useTheme()
+  const renderer = useRenderer()
+  const [hover, setHover] = createSignal(false)
+  const expanded = () => ctx.harnessTraceExpanded(props.messageID)
+  const color = () => {
+    if (props.error) return theme.text.feedback.error.base
+    return hover() ? theme.text.base : theme.text.muted
+  }
+  return (
+    <box
+      paddingLeft={3}
+      onMouseOver={() => setHover(true)}
+      onMouseOut={() => setHover(false)}
+      onMouseUp={() => {
+        if (renderer.getSelection()?.getSelectedText()) return
+        ctx.setHarnessTraceExpanded(props.messageID, !expanded())
+      }}
+    >
+      <box flexDirection="row">
+        <box width={INLINE_TOOL_ICON_WIDTH} flexShrink={0}>
+          <text fg={color()}>{expanded() ? "−" : "+"}</text>
+        </box>
+        <text flexGrow={1} minWidth={0} wrapMode="none" truncate fg={color()}>
+          {props.title}
         </text>
       </box>
-    </Show>
+      <Show when={expanded()}>
+        <box paddingLeft={2}>
+          <text fg={props.error ? theme.text.feedback.error.base : theme.text.muted}>{props.detail}</text>
+        </box>
+      </Show>
+    </box>
   )
 }
 
@@ -2762,9 +2979,7 @@ function BlockTool(props: BlockToolProps) {
               <Show
                 when={props.spinner}
                 fallback={
-                  <text
-                    fg={permission() ? theme.text.feedback.warning.base : (props.headerColor ?? theme.text.muted)}
-                  >
+                  <text fg={permission() ? theme.text.feedback.warning.base : (props.headerColor ?? theme.text.muted)}>
                     {title()}
                   </text>
                 }
@@ -2952,11 +3167,7 @@ function ShellDisplay(props: {
           <Show
             when={isRunning()}
             fallback={
-              <text
-                fg={theme.text.base}
-                wrapMode={expanded() ? "word" : "char"}
-                maxHeight={expanded() ? undefined : 2}
-              >
+              <text fg={theme.text.base} wrapMode={expanded() ? "word" : "char"} maxHeight={expanded() ? undefined : 2}>
                 {limitedInput()}
               </text>
             }
@@ -3057,7 +3268,9 @@ function Read(props: ToolProps) {
         Read {pathFormatter.format(stringValue(props.input.path))}
         <Show when={props.input.offset !== undefined || props.input.limit !== undefined}>
           :{finiteNumber(props.input.offset) || 1}-
-          {props.input.limit ? (finiteNumber(props.input.offset) || 1) + (finiteNumber(props.input.limit) || 0) - 1 : ""}
+          {props.input.limit
+            ? (finiteNumber(props.input.offset) || 1) + (finiteNumber(props.input.limit) || 0) - 1
+            : ""}
         </Show>
       </InlineTool>
       <For each={loaded()}>
